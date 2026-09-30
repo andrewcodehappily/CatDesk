@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -160,6 +161,55 @@ impl TokenStatsLayout {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum WidgetCornerStyle {
+    #[default]
+    Rounded,
+    Square,
+}
+
+impl WidgetCornerStyle {
+    pub fn all() -> &'static [WidgetCornerStyle] {
+        const STYLES: [WidgetCornerStyle; 2] =
+            [WidgetCornerStyle::Rounded, WidgetCornerStyle::Square];
+        &STYLES
+    }
+
+    pub fn label_for(self, language: UiLanguage) -> &'static str {
+        match (self, language) {
+            (Self::Rounded, UiLanguage::English) => "Rounded",
+            (Self::Square, UiLanguage::English) => "Square",
+            (Self::Rounded, UiLanguage::TraditionalChinese) => "圓角",
+            (Self::Square, UiLanguage::TraditionalChinese) => "方角",
+        }
+    }
+
+    pub fn description_for(self, language: UiLanguage) -> &'static str {
+        if language == UiLanguage::English {
+            return self.description();
+        }
+        match self {
+            Self::Rounded => "Widget 邊角使用圓角樣式。",
+            Self::Square => "Widget 邊角使用直角樣式。",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Rounded => "Use rounded corners for the web widget.",
+            Self::Square => "Use square corners for the web widget.",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rounded => "rounded",
+            Self::Square => "square",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShowDetailMode {
     Disable,
     #[default]
@@ -259,6 +309,19 @@ impl UiLanguage {
         }
     }
 }
+pub fn app_config_path() -> std::io::Result<PathBuf> {
+    Ok(user_home_dir()?
+        .join(APP_CONFIG_DIR_NAME)
+        .join(APP_CONFIG_FILE_NAME))
+}
+
+pub fn save_widget_corner_style(style: WidgetCornerStyle) -> std::io::Result<PathBuf> {
+    let path = app_config_path()?;
+    let mut config = AppConfig::load_from_path(&path)?;
+    config.widget_corner_style = style;
+    config.save_to_path(&path)?;
+    Ok(path)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,6 +340,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub show_detail_mode: ShowDetailMode,
     #[serde(default)]
+    pub widget_corner_style: WidgetCornerStyle,
+    #[serde(default)]
     pub macos_terminal_profile: Option<bool>,
     #[serde(default)]
     pub ui_language: UiLanguage,
@@ -284,12 +349,20 @@ pub struct AppConfig {
     pub partner_binagotchy_seed: Option<String>,
     #[serde(default)]
     pub set_catdesk_as_co_author: bool,
+    #[serde(default)]
+    pub handoff_enabled: bool,
+    #[serde(default = "default_sandbox_enabled")]
+    pub sandbox_enabled: bool,
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub selected_browser: Option<DetectedBrowser>,
+}
+
+fn default_sandbox_enabled() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -303,10 +376,13 @@ impl Default for AppConfig {
             agents_path_mode: AgentsPathMode::Default,
             token_stats_layout: TokenStatsLayout::Right,
             show_detail_mode: ShowDetailMode::Expanded,
+            widget_corner_style: WidgetCornerStyle::Rounded,
             macos_terminal_profile: None,
             ui_language: UiLanguage::English,
             partner_binagotchy_seed: None,
             set_catdesk_as_co_author: false,
+            handoff_enabled: false,
+            sandbox_enabled: true,
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
@@ -588,6 +664,8 @@ pub struct AppState {
     pub mascot_seed: u64,
     pub partner_binagotchy_seed: Option<String>,
     pub set_catdesk_as_co_author: bool,
+    pub handoff_enabled: bool,
+    pub sandbox_enabled: bool,
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
@@ -596,6 +674,7 @@ pub struct AppState {
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
+    pub last_tool_call_ms: Option<u128>,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
@@ -654,12 +733,6 @@ pub fn user_home_dir() -> std::io::Result<PathBuf> {
     Err(std::io::Error::other(
         "could not resolve the user home directory from HOME, USERPROFILE, or HOMEDRIVE/HOMEPATH",
     ))
-}
-
-pub fn app_config_path() -> std::io::Result<PathBuf> {
-    Ok(user_home_dir()?
-        .join(APP_CONFIG_DIR_NAME)
-        .join(APP_CONFIG_FILE_NAME))
 }
 
 pub fn load_app_config() -> std::io::Result<AppConfig> {
@@ -732,15 +805,18 @@ pub(crate) fn parse_seed_hex(seed: &str) -> std::io::Result<u64> {
     })
 }
 
+pub(crate) fn local_now() -> OffsetDateTime {
+    let now = OffsetDateTime::now_utc();
+    let offset = UtcOffset::local_offset_at(now).unwrap_or(UtcOffset::UTC);
+    now.to_offset(offset)
+}
+
+fn format_hms(now: OffsetDateTime) -> String {
+    format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+}
+
 fn now_hms() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    format_hms(local_now())
 }
 
 fn now_unix_millis() -> u128 {
@@ -958,6 +1034,8 @@ impl AppState {
             mascot_seed,
             partner_binagotchy_seed,
             set_catdesk_as_co_author: config.set_catdesk_as_co_author,
+            handoff_enabled: config.handoff_enabled,
+            sandbox_enabled: config.sandbox_enabled,
             mascot,
             workspace_root,
             detected_browsers: Vec::new(),
@@ -967,6 +1045,7 @@ impl AppState {
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
+            last_tool_call_ms: None,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
@@ -1015,6 +1094,8 @@ impl AppState {
         config.chatgpt_connector_revision = self.chatgpt_connector_revision;
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
+        config.handoff_enabled = self.handoff_enabled;
+        config.sandbox_enabled = self.sandbox_enabled;
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
@@ -1128,6 +1209,9 @@ impl AppState {
         let only_bootstrap_status_events = events_are_bootstrap_status_events(events);
         let starts_tool_call = direction == FlowDirection::Forward
             && events.iter().any(|event| event.starts_with("tools/call:"));
+        if starts_tool_call {
+            self.last_tool_call_ms = Some(now_ms);
+        }
 
         if let Some(idx) = self.flows.iter().position(|flow| flow.flow_id == flow_id) {
             let mut flow = self.flows.remove(idx);
@@ -1362,6 +1446,14 @@ mod tests {
     }
 
     #[test]
+    fn log_time_uses_the_datetime_offset() {
+        let local = OffsetDateTime::from_unix_timestamp(0)
+            .expect("unix epoch")
+            .to_offset(UtcOffset::from_hms(9, 0, 0).expect("UTC+09"));
+        assert_eq!(format_hms(local), "09:00:00");
+    }
+
+    #[test]
     fn log_ids_stay_stable_when_old_entries_are_evicted() {
         let (mut app, workspace, config_path) = test_app("catdesk-log-id-buffer");
 
@@ -1516,6 +1608,8 @@ mod tests {
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
         assert!(app.set_catdesk_as_co_author);
+        assert!(!app.handoff_enabled);
+        assert!(app.sandbox_enabled);
         assert_eq!(
             app.partner_binagotchy_seed.as_deref(),
             Some("00000000000000ff")
@@ -1601,6 +1695,7 @@ toolCallCount = 1
         app.theme = "neon".into();
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
+        app.handoff_enabled = true;
         app.usage_by_model
             .entry(CURRENT_USAGE_BUCKET.to_string())
             .or_default()
@@ -1612,6 +1707,7 @@ toolCallCount = 1
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
+        assert!(saved.handoff_enabled);
         let saved_usage = saved
             .usage_by_model
             .get(CURRENT_USAGE_BUCKET)
@@ -1628,6 +1724,7 @@ toolCallCount = 1
         )
         .expect("reload app state");
         assert_eq!(reloaded.all_time_usage_totals().total_tokens, 20);
+        assert!(reloaded.handoff_enabled);
         assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);
@@ -1744,6 +1841,29 @@ toolCallCount = 1
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config");
         assert!(matches!(saved.show_detail_mode, ShowDetailMode::Collapsed));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn app_config_round_trips_disabled_sandbox() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-config-sandbox-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp config dir");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+
+        let config = AppConfig {
+            sandbox_enabled: false,
+            ..AppConfig::default()
+        };
+        config.save_to_path(&config_path).expect("save config");
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load config");
+        assert!(!saved.sandbox_enabled);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
@@ -1883,11 +2003,13 @@ toolCallCount = 0
     fn record_flow_tool_call_does_not_activate_bootstrap_status() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-tool-call");
 
+        assert!(app.last_tool_call_ms.is_none());
         app.record_flow(
             "stateless",
             &["tools/call:run_command".to_string()],
             FlowDirection::Forward,
         );
+        assert!(app.last_tool_call_ms.is_some());
 
         let flow = app.flows.first().expect("missing flow");
         assert!(!flow.bootstrap_status_active);

@@ -95,10 +95,6 @@ pub fn router(
             post(post_token_stats_layout).options(options_token_stats_layout),
         )
         .route(
-            &show_detail_mode,
-            post(post_show_detail_mode).options(options_show_detail_mode),
-        )
-        .route(
             &terminal_open_path,
             post(post_terminal_open).options(options_terminal),
         )
@@ -117,6 +113,10 @@ pub fn router(
         .route(
             &terminal_session_path,
             delete(delete_terminal_session).options(options_terminal),
+        )
+        .route(
+            &show_detail_mode,
+            post(post_show_detail_mode).options(options_show_detail_mode),
         )
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
@@ -1915,7 +1915,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 12);
+        assert_eq!(widgets.len(), 11);
         assert_eq!(
             widgets
                 .iter()
@@ -1932,7 +1932,6 @@ mod tests {
                 "search",
                 "write",
                 "edit",
-                "create_handoff",
                 "delete",
             ]
         );
@@ -2776,12 +2775,13 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
 
-        let app = AppState::new_for_test(
+        let mut app = AppState::new_for_test(
             8787,
             workspace_root.to_string_lossy().into_owned(),
             config_path.clone(),
         )
         .expect("create app state");
+        app.sandbox_enabled = false;
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let command_jobs = CommandJobManager::new();
@@ -3357,6 +3357,8 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
+        handoff_enabled,
+        sandbox_enabled,
         ngrok_url,
         mcp_path,
         partner_binagotchy_seed,
@@ -3369,6 +3371,8 @@ async fn post_mcp_inner(
             app.mode,
             app.tool_mode,
             app.set_catdesk_as_co_author,
+            app.handoff_enabled,
+            app.sandbox_enabled,
             app.ngrok_url.clone(),
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
@@ -3398,6 +3402,8 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
+        handoff_enabled,
+        sandbox_enabled,
         s.catdesk_instruction_called.load(Ordering::Acquire),
         &s.command_jobs,
         &s.devtools,
