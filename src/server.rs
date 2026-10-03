@@ -915,7 +915,7 @@ fn rewrite_catdesk_instruction_action_urls(
         .map(|base| format!("{base}/binagotchy"));
     widget_payload.insert(
         "binagotchyApiBaseUrl".to_string(),
-        json!(binagotchy_action_base_url.unwrap_or_default()),
+        json!(binagotchy_action_base_url.as_deref().unwrap_or("")),
     );
     widget_payload.insert(
         "agentsPathModeUrl".to_string(),
@@ -953,6 +953,30 @@ fn rewrite_catdesk_instruction_action_urls(
                 .unwrap_or_default()
         ),
     );
+
+    if let Some(base) = binagotchy_action_base_url.as_deref()
+        && let Some(cards) = widget_payload
+            .get_mut("binagotchyCards")
+            .and_then(Value::as_array_mut)
+    {
+        for card in cards.iter_mut().filter_map(Value::as_object_mut) {
+            let Some(folder) = card
+                .get("folder")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            card.insert(
+                "saveFolderUrl".to_string(),
+                json!(format!("{base}/archive/{folder}/save")),
+            );
+            card.insert(
+                "setPartnerUrl".to_string(),
+                json!(format!("{base}/partner")),
+            );
+        }
+    }
 }
 
 fn attach_catdesk_instruction_actions(
@@ -988,12 +1012,6 @@ fn attach_catdesk_instruction_actions(
         return;
     };
 
-    let public_action_base_url = public_base_url
-        .zip(mcp_path.strip_suffix("/mcp"))
-        .map(|(base, secret_prefix)| format!("{base}{secret_prefix}"));
-    let binagotchy_action_base_url = public_action_base_url
-        .as_deref()
-        .map(|base| format!("{base}/binagotchy"));
     widget_payload.insert(
         "partnerBinagotchySeed".to_string(),
         json!(partner_binagotchy_seed.unwrap_or("")),
@@ -1011,27 +1029,10 @@ fn attach_catdesk_instruction_actions(
             let Some(card_obj) = card.as_object_mut() else {
                 continue;
             };
-            let Some(folder) = card_obj
-                .get("folder")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                continue;
-            };
             let is_partner = partner_binagotchy_seed
                 .zip(card_obj.get("seed").and_then(Value::as_str))
                 .is_some_and(|(partner_seed, card_seed)| partner_seed == card_seed);
             card_obj.insert("isPartner".to_string(), json!(is_partner));
-            if let Some(base) = binagotchy_action_base_url.as_deref() {
-                card_obj.insert(
-                    "saveFolderUrl".to_string(),
-                    json!(format!("{base}/archive/{folder}/save")),
-                );
-                card_obj.insert(
-                    "setPartnerUrl".to_string(),
-                    json!(format!("{base}/partner")),
-                );
-            }
         }
     }
 }
@@ -1434,6 +1435,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::{Mutex, mpsc::unbounded_channel};
+
+    static WORKSPACE_ROUTING_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn tool_flow_label_includes_selected_argument_summary() {
@@ -2985,6 +2988,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_router_forwards_tool_calls_to_bound_worker() {
+        let _routing_guard = WORKSPACE_ROUTING_TEST_MUTEX.lock().await;
         let worker_workspace = unique_temp_path("catdesk-workspace-route-worker");
         let router_workspace = unique_temp_path("catdesk-workspace-route-router");
         let config_root = unique_temp_path("catdesk-workspace-route-config");
@@ -3009,7 +3013,11 @@ mod tests {
                     },
                     "_meta": {
                         WIDGET_PAYLOAD_META_KEY: {
-                            "agentsPathStateUrl": ""
+                            "agentsPathStateUrl": "",
+                            "binagotchyCards": [{
+                                "folder": "20260925T000000000Z_deadbeef",
+                                "seed": "deadbeef"
+                            }]
                         }
                     }
                 }
@@ -3071,6 +3079,20 @@ mod tests {
                 .and_then(Value::as_str),
             Some(expected.as_str())
         );
+        let card_base =
+            format!("https://router.example/{router_slug}/workspace/{worker_port}/binagotchy");
+        assert_eq!(
+            response_json
+                .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/saveFolderUrl")
+                .and_then(Value::as_str),
+            Some(format!("{card_base}/archive/20260925T000000000Z_deadbeef/save").as_str())
+        );
+        assert_eq!(
+            response_json
+                .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/setPartnerUrl")
+                .and_then(Value::as_str),
+            Some(format!("{card_base}/partner").as_str())
+        );
 
         workspace_router::unregister_workspace(&worker_workspace.to_string_lossy(), worker_port)
             .expect("unregister worker");
@@ -3084,6 +3106,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_widget_actions_proxy_to_registered_worker() {
+        let _routing_guard = WORKSPACE_ROUTING_TEST_MUTEX.lock().await;
         let worker_workspace = unique_temp_path("catdesk-workspace-action-worker");
         let router_workspace = unique_temp_path("catdesk-workspace-action-router");
         let config_root = unique_temp_path("catdesk-workspace-action-config");
