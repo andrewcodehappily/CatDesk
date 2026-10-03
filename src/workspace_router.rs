@@ -220,18 +220,29 @@ fn resolve_session_at(path: &Path, session_id: &str) -> Result<WorkspaceRegistra
     Ok(next)
 }
 
-pub fn registration_for_port(port: u16) -> Result<WorkspaceRegistration, String> {
+pub fn bound_registration(session_id: &str) -> Result<Option<WorkspaceRegistration>, String> {
     let path = registry_path().map_err(|error| error.to_string())?;
-    let _lock = acquire_registry_lock(&path).map_err(|error| error.to_string())?;
-    let mut registry = load_registry(&path).map_err(|error| error.to_string())?;
+    bound_registration_at(&path, session_id)
+}
+
+fn bound_registration_at(
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<WorkspaceRegistration>, String> {
+    let _lock = acquire_registry_lock(path).map_err(|error| error.to_string())?;
+    let mut registry = load_registry(path).map_err(|error| error.to_string())?;
     prune_stale(&mut registry);
     let registration = registry
-        .workspaces
-        .iter()
-        .find(|entry| entry.port == port)
-        .cloned()
-        .ok_or_else(|| format!("No live CatDesk workspace worker is registered on port {port}"))?;
-    save_registry(&path, &registry).map_err(|error| error.to_string())?;
+        .sessions
+        .get(session_id)
+        .and_then(|workspace| {
+            registry
+                .workspaces
+                .iter()
+                .find(|entry| &entry.workspace == workspace)
+        })
+        .cloned();
+    save_registry(path, &registry).map_err(|error| error.to_string())?;
     Ok(registration)
 }
 

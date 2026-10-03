@@ -1,18 +1,23 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, Method, Response, StatusCode, header},
     response::Json,
     routing::{any, delete, get, post},
 };
-use base64::Engine as _;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
@@ -34,6 +39,80 @@ struct ServerState {
     command_jobs: CommandJobManager,
     ui_events: UnboundedSender<ServerUiEvent>,
     catdesk_instruction_called: Arc<AtomicBool>,
+    workspace_action_secret: Arc<[u8; 32]>,
+}
+
+const WORKSPACE_ACTION_CAPABILITY_TTL_SECS: u64 = 24 * 60 * 60;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceActionCapability {
+    session: String,
+    port: u16,
+    path: String,
+    expires_at: u64,
+}
+
+fn new_workspace_action_secret() -> Arc<[u8; 32]> {
+    let mut secret = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret);
+    Arc::new(secret)
+}
+
+fn unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn sign_workspace_action_capability(
+    secret: &[u8],
+    session: &str,
+    port: u16,
+    path: &str,
+) -> Option<String> {
+    let capability = WorkspaceActionCapability {
+        session: session.to_string(),
+        port,
+        path: path.to_string(),
+        expires_at: unix_time_secs().saturating_add(WORKSPACE_ACTION_CAPABILITY_TTL_SECS),
+    };
+    let payload = serde_json::to_vec(&capability).ok()?;
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+    mac.update(payload.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Some(format!("{payload}.{signature}"))
+}
+
+fn verify_workspace_action_capability(
+    secret: &[u8],
+    token: &str,
+    port: u16,
+    path: &str,
+) -> Result<WorkspaceActionCapability, &'static str> {
+    let (payload, signature) = token.split_once('.').ok_or("invalid action capability")?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| "invalid action capability")?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| "invalid action capability")?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| "invalid action capability")?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "invalid action capability")?;
+    let capability: WorkspaceActionCapability =
+        serde_json::from_slice(&payload).map_err(|_| "invalid action capability")?;
+    if capability.expires_at < unix_time_secs() {
+        return Err("expired action capability");
+    }
+    if capability.port != port || capability.path != path || capability.session.is_empty() {
+        return Err("action capability does not match this workspace action");
+    }
+    Ok(capability)
 }
 
 /// Build the axum router.
@@ -50,6 +129,7 @@ pub fn router(
         command_jobs,
         ui_events,
         catdesk_instruction_called: Arc::new(AtomicBool::new(false)),
+        workspace_action_secret: new_workspace_action_secret(),
     };
     let secret_prefix = mcp_path
         .strip_suffix("/mcp")
@@ -101,34 +181,73 @@ pub fn router(
 async fn proxy_workspace_action(
     State(s): State<ServerState>,
     Path((port, path)): Path<(u16, String)>,
+    Query(query): Query<HashMap<String, String>>,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let registration =
-        match tokio::task::spawn_blocking(move || workspace_router::registration_for_port(port))
-            .await
-        {
-            Ok(Ok(registration)) => registration,
-            Ok(Err(message)) => {
-                return with_widget_action_cors(Response::builder())
-                    .status(StatusCode::NOT_FOUND)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "ok": false, "error": message }).to_string(),
-                    ))
-                    .unwrap();
-            }
-            Err(error) => {
-                return with_widget_action_cors(Response::builder())
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "ok": false, "error": error.to_string() }).to_string(),
-                    ))
-                    .unwrap();
-            }
-        };
+    let Some(capability) = query.get("cap") else {
+        return with_widget_action_cors(Response::builder())
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "ok": false, "error": "missing action capability" }).to_string(),
+            ))
+            .unwrap();
+    };
+    let capability = match verify_workspace_action_capability(
+        s.workspace_action_secret.as_ref(),
+        capability,
+        port,
+        path.trim_start_matches('/'),
+    ) {
+        Ok(capability) => capability,
+        Err(message) => {
+            return with_widget_action_cors(Response::builder())
+                .status(StatusCode::FORBIDDEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "ok": false, "error": message }).to_string(),
+                ))
+                .unwrap();
+        }
+    };
+
+    let session = capability.session.clone();
+    let registration = match tokio::task::spawn_blocking(move || {
+        workspace_router::bound_registration(&session)
+    })
+    .await
+    {
+        Ok(Ok(Some(registration))) if registration.port == port => registration,
+        Ok(Ok(_)) => {
+            return with_widget_action_cors(Response::builder())
+                .status(StatusCode::FORBIDDEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "ok": false, "error": "action capability is no longer bound to this workspace" }).to_string(),
+                ))
+                .unwrap();
+        }
+        Ok(Err(message)) => {
+            return with_widget_action_cors(Response::builder())
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "ok": false, "error": message }).to_string(),
+                ))
+                .unwrap();
+        }
+        Err(error) => {
+            return with_widget_action_cors(Response::builder())
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "ok": false, "error": error.to_string() }).to_string(),
+                ))
+                .unwrap();
+        }
+    };
 
     let secret_prefix = {
         let app = s.app.lock().await;
@@ -881,10 +1000,29 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
     }))
 }
 
+fn build_workspace_action_url(
+    public_action_base_url: Option<&str>,
+    action_path: &str,
+    capability: Option<(&[u8], &str, u16)>,
+) -> String {
+    let Some(base) = public_action_base_url else {
+        return String::new();
+    };
+    let url = format!("{base}/{action_path}");
+    let Some((secret, session, port)) = capability else {
+        return url;
+    };
+    let Some(token) = sign_workspace_action_capability(secret, session, port, action_path) else {
+        return String::new();
+    };
+    format!("{url}?cap={token}")
+}
+
 fn rewrite_catdesk_instruction_action_urls(
     result: &mut Option<Value>,
     public_base_url: Option<&str>,
     mcp_path: &str,
+    capability: Option<(&[u8], &str, u16)>,
 ) {
     let Some(result_obj) = result.as_mut().and_then(Value::as_object_mut) else {
         return;
@@ -910,54 +1048,60 @@ fn rewrite_catdesk_instruction_action_urls(
     let public_action_base_url = public_base_url
         .zip(mcp_path.strip_suffix("/mcp"))
         .map(|(base, secret_prefix)| format!("{base}{secret_prefix}"));
-    let binagotchy_action_base_url = public_action_base_url
-        .as_deref()
-        .map(|base| format!("{base}/binagotchy"));
+    let public_action_base_url = public_action_base_url.as_deref();
+    let local_binagotchy_base = capability.is_none().then(|| {
+        public_action_base_url
+            .map(|base| format!("{base}/binagotchy"))
+            .unwrap_or_default()
+    });
     widget_payload.insert(
         "binagotchyApiBaseUrl".to_string(),
-        json!(binagotchy_action_base_url.as_deref().unwrap_or("")),
+        json!(local_binagotchy_base.unwrap_or_default()),
+    );
+    widget_payload.insert(
+        "binagotchyPartnerUrl".to_string(),
+        json!(build_workspace_action_url(
+            public_action_base_url,
+            "binagotchy/partner",
+            capability,
+        )),
     );
     widget_payload.insert(
         "agentsPathModeUrl".to_string(),
-        json!(
-            public_action_base_url
-                .as_deref()
-                .map(|base| format!("{base}/agents/path-mode"))
-                .unwrap_or_default()
-        ),
+        json!(build_workspace_action_url(
+            public_action_base_url,
+            "agents/path-mode",
+            capability,
+        )),
     );
     widget_payload.insert(
         "agentsPathStateUrl".to_string(),
-        json!(
-            public_action_base_url
-                .as_deref()
-                .map(|base| format!("{base}/agents/path-state"))
-                .unwrap_or_default()
-        ),
+        json!(build_workspace_action_url(
+            public_action_base_url,
+            "agents/path-state",
+            capability,
+        )),
     );
     widget_payload.insert(
         "tokenStatsLayoutUrl".to_string(),
-        json!(
-            public_action_base_url
-                .as_deref()
-                .map(|base| format!("{base}/layout/token-stats"))
-                .unwrap_or_default()
-        ),
+        json!(build_workspace_action_url(
+            public_action_base_url,
+            "layout/token-stats",
+            capability,
+        )),
     );
     widget_payload.insert(
         "showDetailModeUrl".to_string(),
-        json!(
-            public_action_base_url
-                .as_deref()
-                .map(|base| format!("{base}/layout/show-detail"))
-                .unwrap_or_default()
-        ),
+        json!(build_workspace_action_url(
+            public_action_base_url,
+            "layout/show-detail",
+            capability,
+        )),
     );
 
-    if let Some(base) = binagotchy_action_base_url.as_deref()
-        && let Some(cards) = widget_payload
-            .get_mut("binagotchyCards")
-            .and_then(Value::as_array_mut)
+    if let Some(cards) = widget_payload
+        .get_mut("binagotchyCards")
+        .and_then(Value::as_array_mut)
     {
         for card in cards.iter_mut().filter_map(Value::as_object_mut) {
             let Some(folder) = card
@@ -969,11 +1113,19 @@ fn rewrite_catdesk_instruction_action_urls(
             };
             card.insert(
                 "saveFolderUrl".to_string(),
-                json!(format!("{base}/archive/{folder}/save")),
+                json!(build_workspace_action_url(
+                    public_action_base_url,
+                    &format!("binagotchy/archive/{folder}/save"),
+                    capability,
+                )),
             );
             card.insert(
                 "setPartnerUrl".to_string(),
-                json!(format!("{base}/partner")),
+                json!(build_workspace_action_url(
+                    public_action_base_url,
+                    "binagotchy/partner",
+                    capability,
+                )),
             );
         }
     }
@@ -986,7 +1138,7 @@ fn attach_catdesk_instruction_actions(
     mascot_seed: u64,
     partner_binagotchy_seed: Option<&str>,
 ) {
-    rewrite_catdesk_instruction_action_urls(result, public_base_url, mcp_path);
+    rewrite_catdesk_instruction_action_urls(result, public_base_url, mcp_path, None);
     let Some(result_obj) = result.as_mut().and_then(Value::as_object_mut) else {
         return;
     };
@@ -1657,6 +1809,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         sync_show_detail_mode_state(&server_state, ShowDetailMode::Disable).await;
@@ -1693,6 +1846,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let response = post_mcp(
@@ -1743,6 +1897,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let response = post_mcp(
@@ -1801,6 +1956,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let response = post_mcp(
@@ -1874,6 +2030,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let response = post_mcp(
@@ -2016,6 +2173,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let discover = post_mcp_http(
@@ -2163,6 +2321,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let legacy_shape = post_mcp_http(
@@ -2533,6 +2692,7 @@ mod tests {
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
         let command = if cfg!(windows) {
             "Start-Sleep -Milliseconds 250; Write-Output http-job-done"
@@ -2651,6 +2811,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: instruction_called.clone(),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let blocked_response = post_mcp(
@@ -2760,6 +2921,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: instruction_called.clone(),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let discover = post_mcp_json_with_show_detail_mode(
@@ -2934,6 +3096,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
         let response = post_mcp(
@@ -3047,6 +3210,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
         let request = json!({
             "jsonrpc": "2.0",
@@ -3073,26 +3237,59 @@ mod tests {
         let expected = format!(
             "https://router.example/{router_slug}/workspace/{worker_port}/agents/path-state"
         );
-        assert_eq!(
-            response_json
-                .pointer("/result/_meta/catdesk~1widgetPayload/agentsPathStateUrl")
-                .and_then(Value::as_str),
-            Some(expected.as_str())
-        );
+        let agents_url = response_json
+            .pointer("/result/_meta/catdesk~1widgetPayload/agentsPathStateUrl")
+            .and_then(Value::as_str)
+            .expect("routed agents action URL");
+        let (agents_base, agents_capability) = agents_url
+            .split_once("?cap=")
+            .expect("agents action capability");
+        assert_eq!(agents_base, expected);
+        let verified = verify_workspace_action_capability(
+            server_state.workspace_action_secret.as_ref(),
+            agents_capability,
+            worker_port,
+            "agents/path-state",
+        )
+        .expect("verify agents action capability");
+        assert_eq!(verified.session, "session-worker-test");
+
         let card_base =
             format!("https://router.example/{router_slug}/workspace/{worker_port}/binagotchy");
+        let save_url = response_json
+            .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/saveFolderUrl")
+            .and_then(Value::as_str)
+            .expect("routed save action URL");
+        let (save_base, save_capability) = save_url
+            .split_once("?cap=")
+            .expect("save action capability");
         assert_eq!(
-            response_json
-                .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/saveFolderUrl")
-                .and_then(Value::as_str),
-            Some(format!("{card_base}/archive/20260925T000000000Z_deadbeef/save").as_str())
+            save_base,
+            format!("{card_base}/archive/20260925T000000000Z_deadbeef/save")
         );
-        assert_eq!(
-            response_json
-                .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/setPartnerUrl")
-                .and_then(Value::as_str),
-            Some(format!("{card_base}/partner").as_str())
-        );
+        verify_workspace_action_capability(
+            server_state.workspace_action_secret.as_ref(),
+            save_capability,
+            worker_port,
+            "binagotchy/archive/20260925T000000000Z_deadbeef/save",
+        )
+        .expect("verify save action capability");
+
+        let partner_url = response_json
+            .pointer("/result/_meta/catdesk~1widgetPayload/binagotchyCards/0/setPartnerUrl")
+            .and_then(Value::as_str)
+            .expect("routed partner action URL");
+        let (partner_base, partner_capability) = partner_url
+            .split_once("?cap=")
+            .expect("partner action capability");
+        assert_eq!(partner_base, format!("{card_base}/partner"));
+        verify_workspace_action_capability(
+            server_state.workspace_action_secret.as_ref(),
+            partner_capability,
+            worker_port,
+            "binagotchy/partner",
+        )
+        .expect("verify partner action capability");
 
         workspace_router::unregister_workspace(&worker_workspace.to_string_lossy(), worker_port)
             .expect("unregister worker");
@@ -3143,11 +3340,23 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
         };
 
+        let bound =
+            workspace_router::resolve_session("session-action-test").expect("bind action session");
+        assert_eq!(bound.port, worker_port);
+        let capability = sign_workspace_action_capability(
+            server_state.workspace_action_secret.as_ref(),
+            "session-action-test",
+            worker_port,
+            "agents/path-state",
+        )
+        .expect("sign action capability");
         let response = proxy_workspace_action(
-            State(server_state),
+            State(server_state.clone()),
             Path((worker_port, "agents/path-state".to_string())),
+            Query(HashMap::from([("cap".to_string(), capability.clone())])),
             Method::GET,
             HeaderMap::new(),
             Bytes::new(),
@@ -3162,6 +3371,31 @@ mod tests {
             payload.get("workspace").and_then(Value::as_str),
             Some("worker")
         );
+
+        let tampered = proxy_workspace_action(
+            State(server_state.clone()),
+            Path((
+                worker_port.saturating_add(1),
+                "agents/path-state".to_string(),
+            )),
+            Query(HashMap::from([("cap".to_string(), capability.clone())])),
+            Method::GET,
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(tampered.status(), StatusCode::FORBIDDEN);
+
+        let missing = proxy_workspace_action(
+            State(server_state),
+            Path((worker_port, "agents/path-state".to_string())),
+            Query(HashMap::new()),
+            Method::GET,
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
 
         workspace_router::unregister_workspace(&worker_workspace.to_string_lossy(), worker_port)
             .expect("unregister worker");
@@ -3281,6 +3515,7 @@ async fn route_workspace_tool_call(
             &mut result,
             router_public_url.as_deref(),
             &routed_mcp_path,
+            Some((s.workspace_action_secret.as_ref(), session_id, target.port)),
         );
         if let Some(result) = result
             && let Some(object) = forwarded_json.as_object_mut()

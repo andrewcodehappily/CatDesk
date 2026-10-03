@@ -28,7 +28,7 @@ const SERVER_VERSION: &str = "4.0.0";
 pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
-const WIDGET_RESOURCE_REVISION: u32 = 6;
+const WIDGET_RESOURCE_REVISION: u32 = 7;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
@@ -2404,6 +2404,7 @@ fn catdesk_instruction_widget_payload_with_cards(
     }
     payload_obj.insert("tokenStatsLayoutUrl".to_string(), json!(""));
     payload_obj.insert("showDetailModeUrl".to_string(), json!(""));
+    payload_obj.insert("binagotchyPartnerUrl".to_string(), json!(""));
     payload_obj.insert("configPath".to_string(), json!(config_path));
     payload_obj.insert("configPathDisplay".to_string(), json!(config_path_display));
     payload_obj.insert("binagotchyPath".to_string(), json!(binagotchy_path));
@@ -7152,7 +7153,7 @@ hello world"
     #[test]
     fn widget_resource_uri_includes_revision_for_cache_busting() {
         let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-        assert!(uri.contains("widgetRevision=6"));
+        assert!(uri.contains("widgetRevision=7"));
         assert!(uri.contains("toolName=catdesk_instruction"));
     }
 
