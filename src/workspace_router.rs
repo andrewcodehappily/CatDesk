@@ -6,7 +6,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::state::user_home_dir;
 
@@ -16,7 +16,9 @@ pub const WORKER_PORT_END: u16 = 3299;
 const REGISTRY_FILE_NAME: &str = "workspace_id.toml";
 const LOCK_RETRY_COUNT: usize = 100;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const ROUTER_START_LOCK_RETRY_COUNT: usize = 3_000;
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const ROUTER_CLIENT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +35,52 @@ struct WorkspaceRegistry {
     workspaces: Vec<WorkspaceRegistration>,
     #[serde(default)]
     sessions: BTreeMap<String, String>,
+    #[serde(default)]
+    router_clients: Vec<RouterClient>,
+    #[serde(default)]
+    worker_port_reservations: Vec<WorkerPortReservation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterClient {
+    workspace: String,
+    pid: u32,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerPortReservation {
+    workspace: String,
+    pid: u32,
+    port: u16,
+}
+
+/// Keeps the shared router alive while this CatDesk process is starting or
+/// running. Dropping the guard unregisters it on ordinary shutdown.
+pub struct RouterClientGuard {
+    workspace_root: String,
+}
+
+impl Drop for RouterClientGuard {
+    fn drop(&mut self) {
+        let _ = unregister_router_client(&self.workspace_root);
+    }
+}
+
+/// Serializes first-router startup so simultaneously launched workspaces agree
+/// on the persisted connector slug and only one of them spawns the router.
+pub struct RouterStartupLock {
+    lock: RegistryLock,
+}
+
+impl RouterStartupLock {
+    /// Refresh the lock timestamp while a graceful router shutdown is draining
+    /// requests, without disabling stale-lock recovery after a crash.
+    pub fn refresh(&self) -> io::Result<()> {
+        fs::write(&self.lock.path, [])
+    }
 }
 
 struct RegistryLock {
@@ -53,12 +101,22 @@ fn registry_lock_path(path: &Path) -> PathBuf {
     path.with_extension("lock")
 }
 
+pub fn acquire_router_start_lock() -> io::Result<RouterStartupLock> {
+    let path = registry_path()?.with_file_name("router_start.toml");
+    acquire_registry_lock_with_retries(&path, ROUTER_START_LOCK_RETRY_COUNT)
+        .map(|lock| RouterStartupLock { lock })
+}
+
 fn acquire_registry_lock(path: &Path) -> io::Result<RegistryLock> {
+    acquire_registry_lock_with_retries(path, LOCK_RETRY_COUNT)
+}
+
+fn acquire_registry_lock_with_retries(path: &Path, retry_count: usize) -> io::Result<RegistryLock> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let lock_path = registry_lock_path(path);
-    for _ in 0..LOCK_RETRY_COUNT {
+    for _ in 0..retry_count {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -115,6 +173,28 @@ fn port_is_open(port: u16) -> bool {
     TcpStream::connect_timeout(&address, PORT_PROBE_TIMEOUT).is_ok()
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn prune_stale_router_clients(registry: &mut WorkspaceRegistry) {
+    let ttl_ms: u64 = ROUTER_CLIENT_TTL.as_millis().try_into().unwrap_or(u64::MAX);
+    let oldest_live = now_millis().saturating_sub(ttl_ms);
+    registry
+        .router_clients
+        .retain(|client| client.last_seen_ms >= oldest_live);
+    registry.worker_port_reservations.retain(|reservation| {
+        registry.router_clients.iter().any(|client| {
+            client.workspace == reservation.workspace && client.pid == reservation.pid
+        })
+    });
+}
+
 fn prune_stale(registry: &mut WorkspaceRegistry) {
     registry
         .workspaces
@@ -132,6 +212,7 @@ pub fn register_workspace(workspace_root: &str, port: u16) -> io::Result<Workspa
     let _lock = acquire_registry_lock(&path)?;
     let mut registry = load_registry(&path)?;
     prune_stale(&mut registry);
+    prune_stale_router_clients(&mut registry);
 
     let workspace = canonical_workspace(workspace_root)?;
     let registration = WorkspaceRegistration {
@@ -153,8 +234,61 @@ pub fn register_workspace(workspace_root: &str, port: u16) -> io::Result<Workspa
     // Restarting CatDesk in a workspace explicitly makes that workspace available
     // for the next unbound ChatGPT conversation.
     registry.sessions.retain(|_, bound| bound != &workspace);
+    registry.worker_port_reservations.retain(|reservation| {
+        !(reservation.workspace == workspace
+            && reservation.pid == std::process::id()
+            && reservation.port == port)
+    });
     save_registry(&path, &registry)?;
     Ok(registration)
+}
+
+pub fn reserve_worker_port(workspace_root: &str) -> io::Result<u16> {
+    let path = registry_path()?;
+    reserve_worker_port_at(&path, workspace_root)
+}
+
+fn reserve_worker_port_at(path: &Path, workspace_root: &str) -> io::Result<u16> {
+    reserve_worker_port_at_for(path, workspace_root, std::process::id())
+}
+
+fn reserve_worker_port_at_for(path: &Path, workspace_root: &str, pid: u32) -> io::Result<u16> {
+    let _lock = acquire_registry_lock(path)?;
+    let mut registry = load_registry(path)?;
+    prune_stale(&mut registry);
+    prune_stale_router_clients(&mut registry);
+    let workspace =
+        canonical_workspace(workspace_root).unwrap_or_else(|_| workspace_root.to_string());
+    if let Some(existing) = registry
+        .worker_port_reservations
+        .iter()
+        .find(|reservation| reservation.workspace == workspace && reservation.pid == pid)
+    {
+        return Ok(existing.port);
+    }
+
+    for port in WORKER_PORT_START..=WORKER_PORT_END {
+        let already_used = registry.workspaces.iter().any(|entry| entry.port == port)
+            || registry
+                .worker_port_reservations
+                .iter()
+                .any(|reservation| reservation.port == port);
+        if !already_used && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            registry
+                .worker_port_reservations
+                .push(WorkerPortReservation {
+                    workspace,
+                    pid,
+                    port,
+                });
+            save_registry(path, &registry)?;
+            return Ok(port);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        format!("no free CatDesk workspace worker port in {WORKER_PORT_START}..={WORKER_PORT_END}"),
+    ))
 }
 
 pub fn unregister_workspace(workspace_root: &str, port: u16) -> io::Result<()> {
@@ -169,11 +303,93 @@ pub fn unregister_workspace(workspace_root: &str, port: u16) -> io::Result<()> {
         .retain(|entry| !(entry.workspace == workspace && entry.port == port));
     registry.sessions.retain(|_, bound| bound != &workspace);
 
-    if registry.workspaces.is_empty() && registry.sessions.is_empty() {
+    if registry.workspaces.is_empty()
+        && registry.sessions.is_empty()
+        && registry.router_clients.is_empty()
+        && registry.worker_port_reservations.is_empty()
+    {
         let _ = fs::remove_file(&path);
         return Ok(());
     }
     save_registry(&path, &registry)
+}
+
+pub fn register_router_client(workspace_root: &str) -> io::Result<RouterClientGuard> {
+    touch_router_client(workspace_root)?;
+    Ok(RouterClientGuard {
+        workspace_root: workspace_root.to_string(),
+    })
+}
+
+pub fn touch_router_client(workspace_root: &str) -> io::Result<()> {
+    let path = registry_path()?;
+    let _lock = acquire_registry_lock(&path)?;
+    let mut registry = load_registry(&path)?;
+    prune_stale_router_clients(&mut registry);
+    let workspace =
+        canonical_workspace(workspace_root).unwrap_or_else(|_| workspace_root.to_string());
+    let pid = std::process::id();
+    let client = RouterClient {
+        workspace: workspace.clone(),
+        pid,
+        last_seen_ms: now_millis(),
+    };
+    if let Some(existing) = registry
+        .router_clients
+        .iter_mut()
+        .find(|existing| existing.workspace == workspace && existing.pid == pid)
+    {
+        *existing = client;
+    } else {
+        registry.router_clients.push(client);
+    }
+    save_registry(&path, &registry)
+}
+
+pub fn unregister_router_client(workspace_root: &str) -> io::Result<()> {
+    let path = registry_path()?;
+    let _lock = acquire_registry_lock(&path)?;
+    let mut registry = load_registry(&path)?;
+    let workspace =
+        canonical_workspace(workspace_root).unwrap_or_else(|_| workspace_root.to_string());
+    let pid = std::process::id();
+    registry
+        .router_clients
+        .retain(|client| !(client.workspace == workspace && client.pid == pid));
+    registry
+        .worker_port_reservations
+        .retain(|reservation| !(reservation.workspace == workspace && reservation.pid == pid));
+    if registry.workspaces.is_empty()
+        && registry.sessions.is_empty()
+        && registry.router_clients.is_empty()
+        && registry.worker_port_reservations.is_empty()
+    {
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
+    save_registry(&path, &registry)
+}
+
+pub fn has_live_router_clients() -> io::Result<bool> {
+    let path = registry_path()?;
+    has_live_router_clients_at(&path)
+}
+
+fn has_live_router_clients_at(path: &Path) -> io::Result<bool> {
+    let _lock = acquire_registry_lock(path)?;
+    let mut registry = load_registry(path)?;
+    prune_stale_router_clients(&mut registry);
+    let has_clients = !registry.router_clients.is_empty();
+    if registry.workspaces.is_empty()
+        && registry.sessions.is_empty()
+        && registry.worker_port_reservations.is_empty()
+        && !has_clients
+    {
+        let _ = fs::remove_file(path);
+    } else {
+        save_registry(path, &registry)?;
+    }
+    Ok(has_clients)
 }
 
 pub fn resolve_session(session_id: &str) -> Result<WorkspaceRegistration, String> {
@@ -254,18 +470,6 @@ pub fn session_id_from_request(body: &Value) -> Option<&str> {
         .and_then(|meta| meta.get("openai/session"))
         .and_then(Value::as_str)
         .filter(|session| !session.is_empty())
-}
-
-pub fn find_available_worker_port() -> io::Result<u16> {
-    for port in WORKER_PORT_START..=WORKER_PORT_END {
-        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        format!("no free CatDesk workspace worker port in {WORKER_PORT_START}..={WORKER_PORT_END}"),
-    ))
 }
 
 pub async fn router_is_running(mcp_slug: &str) -> bool {
@@ -349,6 +553,7 @@ mod tests {
                     },
                 ],
                 sessions: BTreeMap::new(),
+                ..WorkspaceRegistry::default()
             },
         );
 
@@ -379,10 +584,78 @@ mod tests {
                     pid: 1,
                 }],
                 sessions,
+                ..WorkspaceRegistry::default()
             },
         );
 
         assert!(resolve_session_at(&path, "new-session").is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn router_liveness_keeps_fresh_clients_and_prunes_expired_clients() {
+        let fresh_path = test_registry_path("fresh-router-client");
+        save_test_registry(
+            &fresh_path,
+            &WorkspaceRegistry {
+                router_clients: vec![RouterClient {
+                    workspace: "/tmp/project-a".into(),
+                    pid: 1,
+                    last_seen_ms: now_millis(),
+                }],
+                ..WorkspaceRegistry::default()
+            },
+        );
+        assert!(has_live_router_clients_at(&fresh_path).expect("fresh client is live"));
+
+        let expired_path = test_registry_path("expired-router-client");
+        save_test_registry(
+            &expired_path,
+            &WorkspaceRegistry {
+                router_clients: vec![RouterClient {
+                    workspace: "/tmp/project-a".into(),
+                    pid: 1,
+                    last_seen_ms: now_millis()
+                        .saturating_sub(ROUTER_CLIENT_TTL.as_millis().try_into().unwrap())
+                        .saturating_sub(1),
+                }],
+                ..WorkspaceRegistry::default()
+            },
+        );
+        assert!(!has_live_router_clients_at(&expired_path).expect("expired client is pruned"));
+        assert!(!expired_path.exists());
+
+        let _ = fs::remove_file(fresh_path);
+    }
+
+    #[test]
+    fn worker_port_reservations_are_distinct_for_concurrent_clients() {
+        let path = test_registry_path("worker-port-reservations");
+        save_test_registry(
+            &path,
+            &WorkspaceRegistry {
+                router_clients: vec![
+                    RouterClient {
+                        workspace: "/tmp/project-a".into(),
+                        pid: 1,
+                        last_seen_ms: now_millis(),
+                    },
+                    RouterClient {
+                        workspace: "/tmp/project-b".into(),
+                        pid: 2,
+                        last_seen_ms: now_millis(),
+                    },
+                ],
+                ..WorkspaceRegistry::default()
+            },
+        );
+
+        let first = reserve_worker_port_at_for(&path, "/tmp/project-a", 1)
+            .expect("reserve first worker port");
+        let second = reserve_worker_port_at_for(&path, "/tmp/project-b", 2)
+            .expect("reserve second worker port");
+        assert_ne!(first, second);
+
         let _ = fs::remove_file(path);
     }
 }

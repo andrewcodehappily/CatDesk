@@ -1468,6 +1468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An error means a provider was already installed, which is equally fine.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    if std::env::args().any(|arg| arg == "--background-router") {
+        return run_background_router().await;
+    }
+
     let terminal_profile_enabled = macos_terminal_profile_enabled()?;
     match macos_terminal::maybe_relaunch_in_terminal_profile(terminal_profile_enabled) {
         Ok(macos_terminal::LaunchAction::Continue) => {}
@@ -1496,22 +1500,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = AppState::new(
         explicit_port.unwrap_or(workspace_router::ROUTER_PORT),
-        workspace_root,
+        workspace_root.clone(),
     )?;
-    if explicit_port.is_none() && workspace_router::router_is_running(&app.mcp_slug).await {
-        app.port = workspace_router::find_available_worker_port()?;
+    let (router_client, router_client_heartbeat) = if explicit_port.is_none() {
+        let _router_start_lock = workspace_router::acquire_router_start_lock()?;
+        let client = workspace_router::register_router_client(&workspace_root)?;
+        // The first workspace persists its generated slug. Concurrent starters
+        // wait above, then adopt that slug before checking or spawning the
+        // shared router.
+        if let Some(mcp_slug) = load_app_config()?.mcp_slug {
+            app.mcp_slug = mcp_slug;
+        }
+        app.persist_state_with_log();
+        ensure_background_router(&app.mcp_slug).await?;
+        app.port = workspace_router::reserve_worker_port(&workspace_root)?;
         app.workspace_worker = true;
         let worker_config = app.isolate_workspace_worker_config()?;
         set_process_config_path_override(worker_config.clone()).map_err(std::io::Error::other)?;
         app.log(
             "INFO",
             format!(
-                "Existing CatDesk router detected; registered this process as a workspace worker on port {} with isolated config {}",
+                "Shared CatDesk router is ready; registered this process as a workspace worker on port {} with isolated config {}",
                 app.port,
                 worker_config.display()
             ),
         );
-    }
+        let heartbeat_workspace = workspace_root.clone();
+        let heartbeat_mcp_slug = app.mcp_slug.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let root = heartbeat_workspace.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    workspace_router::touch_router_client(&root)
+                })
+                .await;
+                if !workspace_router::router_is_running(&heartbeat_mcp_slug).await
+                    && let Some(start_lock) =
+                        tokio::task::spawn_blocking(workspace_router::acquire_router_start_lock)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                {
+                    let _start_lock = start_lock;
+                    let _ = ensure_background_router(&heartbeat_mcp_slug).await;
+                }
+            }
+        });
+        (Some(client), Some(heartbeat))
+    } else {
+        (None, None)
+    };
     let state: SharedState = Arc::new(Mutex::new(app));
     {
         let mut app = state.lock().await;
@@ -1592,8 +1632,139 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.last_remote_activity_ms = None;
     }
     let _ = workspace_router::unregister_workspace(&registered_workspace, registered_port);
+    if let Some(heartbeat) = router_client_heartbeat {
+        heartbeat.abort();
+    }
+    drop(router_client);
 
     result
+}
+
+async fn ensure_background_router(mcp_slug: &str) -> std::io::Result<()> {
+    if workspace_router::router_is_running(mcp_slug).await {
+        return Ok(());
+    }
+
+    let executable = std::env::current_exe()?;
+    std::process::Command::new(executable)
+        .arg("--background-router")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    for _ in 0..50 {
+        if workspace_router::router_is_running(mcp_slug).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out waiting for the CatDesk background router to start",
+    ))
+}
+
+async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = std::env::current_dir()?.to_string_lossy().into_owned();
+    let app = AppState::new(workspace_router::ROUTER_PORT, workspace_root)?;
+    let state: SharedState = Arc::new(Mutex::new(app));
+    {
+        let mut app = state.lock().await;
+        app.persist_state_with_log();
+    }
+
+    let (ui_events, _ui_event_rx) = unbounded_channel();
+    let (mcp_path, command_jobs) = {
+        let app = state.lock().await;
+        (app.mcp_path(), app.command_jobs.clone())
+    };
+    let router = server::router(state.clone(), None, command_jobs, mcp_path, ui_events);
+    let listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", workspace_router::ROUTER_PORT))
+            .await?;
+
+    {
+        let mut app = state.lock().await;
+        app.server_running = true;
+        app.log("INFO", "Background workspace router started".into());
+    }
+    if let Err(error) = ngrok::start(state.clone()).await {
+        state.lock().await.log("ERROR", format!("ngrok: {error}"));
+    }
+
+    // Keep the startup lock from the final no-client check until axum has
+    // actually stopped accepting requests. A new workspace takes this lock
+    // before registering, so it either prevents shutdown or waits to spawn a
+    // replacement after this router is gone.
+    let shutdown_lock = Arc::new(std::sync::Mutex::new(
+        None::<workspace_router::RouterStartupLock>,
+    ));
+    let shutdown_lock_for_wait = shutdown_lock.clone();
+    let shutdown_lock_for_refresh = shutdown_lock.clone();
+    let lock_refresher = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Some(lock) = shutdown_lock_for_refresh
+                .lock()
+                .expect("router shutdown lock poisoned")
+                .as_ref()
+            {
+                let _ = lock.refresh();
+            }
+        }
+    });
+    let serve_result = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let has_clients =
+                    tokio::task::spawn_blocking(workspace_router::has_live_router_clients)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                if !has_clients {
+                    let startup_lock =
+                        tokio::task::spawn_blocking(workspace_router::acquire_router_start_lock)
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                    let Some(startup_lock) = startup_lock else {
+                        continue;
+                    };
+                    let has_clients =
+                        tokio::task::spawn_blocking(workspace_router::has_live_router_clients)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(false);
+                    if !has_clients {
+                        *shutdown_lock_for_wait
+                            .lock()
+                            .expect("router shutdown lock poisoned") = Some(startup_lock);
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+    lock_refresher.abort();
+    shutdown_lock
+        .lock()
+        .expect("router shutdown lock poisoned")
+        .take();
+    serve_result?;
+
+    let mut app = state.lock().await;
+    if let Some(handle) = app.ngrok_task.take() {
+        handle.abort();
+    }
+    app.server_running = false;
+    app.ngrok_running = false;
+    app.ngrok_url = None;
+    Ok(())
 }
 
 // ── Phase 1: Mode selection ─────────────────────────────────
