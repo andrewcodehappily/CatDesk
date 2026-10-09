@@ -807,13 +807,16 @@ fn attach_terminal_actions(
     let Some(result_obj) = result.as_mut().and_then(Value::as_object_mut) else {
         return;
     };
-    let is_open_terminal = result_obj
+    let Some(structured) = result_obj
         .get("structuredContent")
         .and_then(Value::as_object)
-        .and_then(|structured| structured.get("toolName"))
-        .and_then(Value::as_str)
-        == Some("open_terminal");
-    if !is_open_terminal {
+    else {
+        return;
+    };
+    let is_successful_open_terminal = structured.get("toolName").and_then(Value::as_str)
+        == Some("open_terminal")
+        && structured.get("success").and_then(Value::as_bool) == Some(true);
+    if !is_successful_open_terminal {
         return;
     }
     let Some(widget_payload) = result_obj
@@ -1246,6 +1249,12 @@ async fn post_terminal_open(
     State(s): State<ServerState>,
     Json(request): Json<TerminalOpenRequest>,
 ) -> Response<Body> {
+    if !s.catdesk_instruction_called.load(Ordering::Acquire) {
+        return terminal_json_response(
+            StatusCode::FORBIDDEN,
+            json!({ "ok": false, "error": "call catdesk_instruction before opening an interactive terminal" }),
+        );
+    }
     let workspace_root = {
         let app = s.app.lock().await;
         if !app.mode.computer_enabled()
@@ -2455,6 +2464,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let base = format!("http://{addr}/secret-slug/terminal");
+        let instruction = client
+            .post(format!("http://{addr}/secret-slug/mcp"))
+            .header("mcp-protocol-version", mcp::MODERN_MCP_PROTOCOL_VERSION)
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "catdesk_instruction")
+            .header("content-type", "application/json")
+            .body(tool_call_body("catdesk_instruction", json!({})))
+            .send()
+            .await
+            .expect("call catdesk_instruction");
+        assert_eq!(instruction.status(), reqwest::StatusCode::OK);
         let opened = client
             .post(format!("{base}/open"))
             .json(&json!({ "rows": 20, "cols": 80 }))
@@ -2638,7 +2658,8 @@ mod tests {
         let mut result = Some(json!({
             "structuredContent": {
                 "schema": "catdesk.review.v1",
-                "toolName": "open_terminal"
+                "toolName": "open_terminal",
+                "success": true
             },
             "_meta": {
                 WIDGET_PAYLOAD_META_KEY: {
@@ -2670,6 +2691,37 @@ mod tests {
                 .and_then(Value::as_str),
             Some("https://example.ngrok.app/secret-slug/terminal")
         );
+    }
+
+    #[test]
+    fn attach_terminal_actions_skips_denied_open_terminal_results() {
+        let mut result = Some(json!({
+            "structuredContent": {
+                "schema": "catdesk.review.v1",
+                "toolName": "open_terminal",
+                "success": false,
+                "errorCode": "CATDESK_INSTRUCTION_REQUIRED"
+            },
+            "_meta": {
+                WIDGET_PAYLOAD_META_KEY: {
+                    "schema": "catdesk.review.v1",
+                    "toolName": "open_terminal"
+                }
+            }
+        }));
+
+        attach_terminal_actions(
+            &mut result,
+            Some("https://example.ngrok.app"),
+            "/secret-slug/mcp",
+        );
+
+        let widget_payload = result
+            .as_ref()
+            .and_then(|value| value.get("_meta"))
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing widget payload");
+        assert!(widget_payload.get("terminalApiBaseUrl").is_none());
     }
 
     #[test]
@@ -2949,6 +3001,13 @@ mod tests {
         );
         assert!(!instruction_called.load(Ordering::Acquire));
 
+        let terminal_blocked = post_terminal_open(
+            State(server_state.clone()),
+            Json(TerminalOpenRequest::default()),
+        )
+        .await;
+        assert_eq!(terminal_blocked.status(), StatusCode::FORBIDDEN);
+
         let instruction_response = post_mcp(
             State(server_state.clone()),
             tool_call_body("catdesk_instruction", json!({})),
@@ -2969,8 +3028,15 @@ mod tests {
         );
         assert!(instruction_called.load(Ordering::Acquire));
 
+        let terminal_allowed = post_terminal_open(
+            State(server_state.clone()),
+            Json(TerminalOpenRequest::default()),
+        )
+        .await;
+        assert_eq!(terminal_allowed.status(), StatusCode::CREATED);
+
         let allowed_response = post_mcp(
-            State(server_state),
+            State(server_state.clone()),
             tool_call_body("read", json!({ "paths": ["hello.txt"] })),
         )
         .await;
@@ -2989,6 +3055,7 @@ mod tests {
             Some("hello world\n")
         );
 
+        server_state.terminal_sessions.close_all();
         let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
