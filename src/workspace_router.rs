@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::state::user_home_dir;
 
@@ -72,15 +73,31 @@ impl Drop for RouterClientGuard {
 /// Serializes first-router startup so simultaneously launched workspaces agree
 /// on the persisted connector slug and only one of them spawns the router.
 pub struct RouterStartupLock {
-    lock: RegistryLock,
+    path: PathBuf,
+    token: String,
 }
 
 impl RouterStartupLock {
-    /// Refresh the lock timestamp while a graceful router shutdown is draining
-    /// requests, without disabling stale-lock recovery after a crash.
-    pub fn refresh(&self) -> io::Result<()> {
-        fs::write(&self.lock.path, [])
+    fn owns_lock(&self) -> bool {
+        fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| toml::from_str::<RouterStartLockOwner>(&text).ok())
+            .is_some_and(|owner| owner.token == self.token)
     }
+}
+
+impl Drop for RouterStartupLock {
+    fn drop(&mut self) {
+        if self.owns_lock() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RouterStartLockOwner {
+    pid: u32,
+    token: String,
 }
 
 struct RegistryLock {
@@ -103,8 +120,88 @@ fn registry_lock_path(path: &Path) -> PathBuf {
 
 pub fn acquire_router_start_lock() -> io::Result<RouterStartupLock> {
     let path = registry_path()?.with_file_name("router_start.toml");
-    acquire_registry_lock_with_retries(&path, ROUTER_START_LOCK_RETRY_COUNT)
-        .map(|lock| RouterStartupLock { lock })
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..ROUTER_START_LOCK_RETRY_COUNT {
+        let token = Uuid::new_v4().to_string();
+        let owner = RouterStartLockOwner {
+            pid: std::process::id(),
+            token: token.clone(),
+        };
+        let temporary_path = path.with_extension(format!("{}.tmp", token));
+        let write_owner = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)?;
+            use std::io::Write as _;
+            file.write_all(
+                toml::to_string(&owner)
+                    .map_err(io::Error::other)?
+                    .as_bytes(),
+            )?;
+            file.flush()
+        })();
+        if let Err(error) = write_owner {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        match fs::hard_link(&temporary_path, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Ok(RouterStartupLock { path, token });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temporary_path);
+                let owner = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| toml::from_str::<RouterStartLockOwner>(&text).ok());
+                let invalid = owner.is_none();
+                let stale_invalid = invalid
+                    && fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(5));
+                if owner.is_some_and(|owner| !process_is_alive(owner.pid)) || stale_invalid {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "timed out waiting for CatDesk router startup lock: {}",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 {
+        return false;
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
 }
 
 fn acquire_registry_lock(path: &Path) -> io::Result<RegistryLock> {
@@ -504,7 +601,6 @@ pub async fn router_is_running(mcp_slug: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     fn test_registry_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

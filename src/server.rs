@@ -3201,6 +3201,7 @@ mod tests {
             config_path.clone(),
         )
         .expect("create router app state");
+        app.workspace_router = true;
         app.ngrok_url = Some("https://router.example".into());
         let router_slug = app.mcp_slug.clone();
         let (ui_tx, _ui_rx) = unbounded_channel();
@@ -3299,6 +3300,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(router_workspace);
         let _ = std::fs::remove_dir_all(worker_workspace);
+    }
+
+    #[tokio::test]
+    async fn workspace_router_rejects_tool_calls_without_openai_session() {
+        let config_root = unique_temp_path("catdesk-router-session-required");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let mut app = AppState::new_for_test(
+            8787,
+            config_root.to_string_lossy().into_owned(),
+            config_root.join("config.toml"),
+        )
+        .expect("create router app state");
+        app.workspace_router = true;
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: Arc::new(Mutex::new(app)),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            workspace_action_secret: new_workspace_action_secret(),
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "session-required",
+            "method": "tools/call",
+            "params": {"name": "run_command", "arguments": {"command": "pwd"}}
+        });
+        let body = Bytes::from(request.to_string());
+        let response = route_workspace_tool_call(&server_state, &request, &body, &HeaderMap::new())
+            .await
+            .expect("router should reject sessionless call");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error response");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)
+                .expect("parse error response")
+                .pointer("/error/message")
+                .and_then(Value::as_str),
+            Some("WorkspaceSessionRequired")
+        );
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[tokio::test]
@@ -3418,11 +3463,11 @@ async fn route_workspace_tool_call(
         return None;
     }
 
-    let session_id = workspace_router::session_id_from_request(body)?;
-    let (workspace_worker, local_port, mcp_path, router_public_url) = {
+    let (workspace_worker, workspace_router, local_port, mcp_path, router_public_url) = {
         let app = s.app.lock().await;
         (
             app.workspace_worker,
+            app.workspace_router,
             app.port,
             app.mcp_path(),
             app.ngrok_url.clone(),
@@ -3431,6 +3476,20 @@ async fn route_workspace_tool_call(
     if workspace_worker {
         return None;
     }
+    if !workspace_router {
+        return None;
+    }
+    let Some(session_id) = workspace_router::session_id_from_request(body) else {
+        return Some(modern_jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            body.get("id"),
+            -32042,
+            "WorkspaceSessionRequired",
+            Some(json!({
+                "message": "The shared CatDesk router requires params._meta.openai/session to route tools/call requests to a workspace worker."
+            })),
+        ));
+    };
 
     let session_owned = session_id.to_string();
     let resolved = match tokio::task::spawn_blocking(move || {

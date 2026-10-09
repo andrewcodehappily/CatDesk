@@ -2,11 +2,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(not(test))]
-use std::sync::OnceLock;
+use std::thread;
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::Mutex;
@@ -108,12 +106,112 @@ impl UsageTotals {
         );
     }
 
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            tool_input_tokens: self
+                .tool_input_tokens
+                .saturating_sub(previous.tool_input_tokens),
+            tool_output_tokens: self
+                .tool_output_tokens
+                .saturating_sub(previous.tool_output_tokens),
+            total_tokens: 0,
+            tool_call_count: self
+                .tool_call_count
+                .saturating_sub(previous.tool_call_count),
+        }
+        .normalized()
+    }
+
     fn normalized(mut self) -> Self {
         self.total_tokens = self
             .tool_input_tokens
             .saturating_add(self.tool_output_tokens);
         self
     }
+}
+
+struct ConfigLock {
+    path: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_config_lock(path: &Path) -> std::io::Result<ConfigLock> {
+    let lock_path = path.with_extension("lock");
+    for _ in 0..3_000 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(ConfigLock { path: lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(5));
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                } else {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "timed out waiting for config lock: {}",
+        lock_path.display()
+    )))
+}
+
+fn update_app_config(update: impl FnOnce(&mut AppConfig)) -> std::io::Result<PathBuf> {
+    let path = app_config_path()?;
+    let _lock = acquire_config_lock(&path)?;
+    let mut config = AppConfig::load_from_path(&path)?;
+    update(&mut config);
+    config.save_to_path(&path)?;
+    Ok(path)
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temporary_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary_path, path)
+}
+
+#[cfg(windows)]
+fn replace_config_file(temporary_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temporary_path = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            temporary_path.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -312,37 +410,14 @@ impl UiLanguage {
         }
     }
 }
-#[cfg(not(test))]
-static PROCESS_CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
 pub fn app_config_path() -> std::io::Result<PathBuf> {
-    #[cfg(not(test))]
-    if let Some(path) = PROCESS_CONFIG_PATH_OVERRIDE.get() {
-        return Ok(path.clone());
-    }
     Ok(user_home_dir()?
         .join(APP_CONFIG_DIR_NAME)
         .join(APP_CONFIG_FILE_NAME))
 }
 
-#[cfg(not(test))]
-pub fn set_process_config_path_override(path: PathBuf) -> Result<(), String> {
-    PROCESS_CONFIG_PATH_OVERRIDE
-        .set(path)
-        .map_err(|_| "CatDesk process config path was already initialized".to_string())
-}
-
-#[cfg(test)]
-pub fn set_process_config_path_override(_path: PathBuf) -> Result<(), String> {
-    Ok(())
-}
-
 pub fn save_widget_corner_style(style: WidgetCornerStyle) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.widget_corner_style = style;
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.widget_corner_style = style)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -485,6 +560,7 @@ impl AppConfig {
         }
 
         let text = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+        let temporary_path = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(true);
         #[cfg(unix)]
@@ -492,15 +568,16 @@ impl AppConfig {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
+        let mut file = options.open(&temporary_path)?;
         use std::io::Write as _;
         file.write_all(text.as_bytes())?;
         file.flush()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))?;
         }
+        replace_config_file(&temporary_path, path)?;
         Ok(())
     }
 }
@@ -684,6 +761,7 @@ pub struct AppState {
     pub port: u16,
     pub workspace_root: String,
     pub workspace_worker: bool,
+    pub workspace_router: bool,
     pub mascot_seed: u64,
     pub partner_binagotchy_seed: Option<String>,
     pub set_catdesk_as_co_author: bool,
@@ -698,6 +776,8 @@ pub struct AppState {
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
+    persisted_usage_by_model: BTreeMap<String, UsageTotals>,
+    persisted_config: AppConfig,
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
@@ -766,11 +846,7 @@ pub fn load_ngrok_authtoken() -> std::io::Result<Option<String>> {
 }
 
 pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_authtoken = Some(token.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.ngrok_authtoken = Some(token.to_string()))
 }
 
 pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
@@ -778,35 +854,19 @@ pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
 }
 
 pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_domain = Some(domain.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.ngrok_domain = Some(domain.to_string()))
 }
 
 pub fn save_agents_path_mode(mode: AgentsPathMode) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.agents_path_mode = mode;
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.agents_path_mode = mode)
 }
 
 pub fn save_token_stats_layout(layout: TokenStatsLayout) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.token_stats_layout = layout;
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.token_stats_layout = layout)
 }
 
 pub fn save_show_detail_mode(mode: ShowDetailMode) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.show_detail_mode = mode;
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.show_detail_mode = mode)
 }
 
 pub fn load_macos_terminal_profile() -> std::io::Result<Option<bool>> {
@@ -814,11 +874,7 @@ pub fn load_macos_terminal_profile() -> std::io::Result<Option<bool>> {
 }
 
 pub fn save_macos_terminal_profile(enabled: bool) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.macos_terminal_profile = Some(enabled);
-    config.save_to_path(&path)?;
-    Ok(path)
+    update_app_config(|config| config.macos_terminal_profile = Some(enabled))
 }
 
 pub(crate) fn parse_seed_hex(seed: &str) -> std::io::Result<u64> {
@@ -1010,7 +1066,9 @@ impl AppState {
         config_path: PathBuf,
     ) -> std::io::Result<Self> {
         let config = AppConfig::load_from_path(&config_path)?;
+        let persisted_config = config.clone();
         let partner_binagotchy_seed = config.partner_binagotchy_seed.clone();
+        let persisted_usage_by_model = config.usage_by_model.clone();
         let mascot_seed = if let Some(seed) = partner_binagotchy_seed.as_deref() {
             parse_seed_hex(seed)?
         } else {
@@ -1061,6 +1119,7 @@ impl AppState {
             mascot,
             workspace_root,
             workspace_worker: false,
+            workspace_router: false,
             detected_browsers: Vec::new(),
             selected_browser: config.selected_browser,
             logs: Vec::new(),
@@ -1069,6 +1128,8 @@ impl AppState {
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
             usage_by_model: config.usage_by_model,
+            persisted_usage_by_model,
+            persisted_config,
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
             config_path,
@@ -1110,53 +1171,62 @@ impl AppState {
 
     fn app_config(&self) -> std::io::Result<AppConfig> {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
-        config.mcp_slug = Some(self.mcp_slug.clone());
-        config.ngrok_domain = self.ngrok_domain.clone();
+        if self.persisted_config.mcp_slug.as_deref() != Some(&self.mcp_slug) {
+            config.mcp_slug = Some(self.mcp_slug.clone());
+        }
+        if self.ngrok_domain != self.persisted_config.ngrok_domain {
+            config.ngrok_domain = self.ngrok_domain.clone();
+        }
         config.last_started_version = Some(env!("CARGO_PKG_VERSION").to_string());
-        config.chatgpt_connector_revision = self.chatgpt_connector_revision;
-        config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
-        config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
-        config.handoff_enabled = self.handoff_enabled;
-        config.sandbox_enabled = self.sandbox_enabled;
-        config.theme = self.theme.clone();
-        config.mode = self.mode;
-        config.tool_mode = self.tool_mode;
-        config.show_detail_mode = self.show_detail_mode;
-        config.ui_language = self.ui_language;
-        config.usage_by_model = self.usage_by_model.clone();
-        config.selected_browser = self.selected_browser.clone();
+        if self.chatgpt_connector_revision != self.persisted_config.chatgpt_connector_revision {
+            config.chatgpt_connector_revision = self.chatgpt_connector_revision;
+        }
+        if self.partner_binagotchy_seed != self.persisted_config.partner_binagotchy_seed {
+            config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
+        }
+        if self.set_catdesk_as_co_author != self.persisted_config.set_catdesk_as_co_author {
+            config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
+        }
+        if self.handoff_enabled != self.persisted_config.handoff_enabled {
+            config.handoff_enabled = self.handoff_enabled;
+        }
+        if self.sandbox_enabled != self.persisted_config.sandbox_enabled {
+            config.sandbox_enabled = self.sandbox_enabled;
+        }
+        if self.theme != self.persisted_config.theme {
+            config.theme = self.theme.clone();
+        }
+        if self.mode != self.persisted_config.mode {
+            config.mode = self.mode;
+        }
+        if self.tool_mode != self.persisted_config.tool_mode {
+            config.tool_mode = self.tool_mode;
+        }
+        if self.show_detail_mode != self.persisted_config.show_detail_mode {
+            config.show_detail_mode = self.show_detail_mode;
+        }
+        if self.ui_language != self.persisted_config.ui_language {
+            config.ui_language = self.ui_language;
+        }
+        for (bucket, usage) in &self.usage_by_model {
+            let previous = self
+                .persisted_usage_by_model
+                .get(bucket)
+                .cloned()
+                .unwrap_or_default();
+            let delta = usage.delta_since(&previous);
+            config
+                .usage_by_model
+                .entry(bucket.clone())
+                .or_default()
+                .merge(&delta);
+        }
+        if serde_json::to_value(&self.selected_browser).ok()
+            != serde_json::to_value(&self.persisted_config.selected_browser).ok()
+        {
+            config.selected_browser = self.selected_browser.clone();
+        }
         Ok(config.normalized())
-    }
-
-    pub fn isolate_workspace_worker_config(&mut self) -> std::io::Result<PathBuf> {
-        let canonical_workspace = Path::new(&self.workspace_root)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(&self.workspace_root));
-        let mut hasher = DefaultHasher::new();
-        canonical_workspace.hash(&mut hasher);
-        let workspace_id = format!("{:016x}", hasher.finish());
-        let path = user_home_dir()?
-            .join(APP_CONFIG_DIR_NAME)
-            .join("workspaces")
-            .join(workspace_id)
-            .join(APP_CONFIG_FILE_NAME);
-
-        if path == self.config_path {
-            return Ok(path);
-        }
-
-        if path.exists() {
-            let previous = AppConfig::load_from_path(&path)?;
-            self.usage_by_model = previous.usage_by_model;
-        }
-
-        let config = self.app_config()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        config.save_to_path(&path)?;
-        self.config_path = path.clone();
-        Ok(path)
     }
 
     pub fn regenerate_mcp_slug(&mut self) {
@@ -1168,8 +1238,13 @@ impl AppState {
         self.chatgpt_connector_refresh_required = false;
     }
 
-    pub fn persist_state(&self) -> std::io::Result<()> {
-        self.app_config()?.save_to_path(&self.config_path)
+    pub fn persist_state(&mut self) -> std::io::Result<()> {
+        let _lock = acquire_config_lock(&self.config_path)?;
+        let config = self.app_config()?;
+        config.save_to_path(&self.config_path)?;
+        self.persisted_usage_by_model = self.usage_by_model.clone();
+        self.persisted_config = config;
+        Ok(())
     }
 
     pub fn persist_state_with_log(&mut self) {
@@ -1782,7 +1857,7 @@ toolCallCount = 1
     }
 
     #[test]
-    fn workspace_worker_config_does_not_overwrite_router_config() {
+    fn shared_config_merges_usage_from_multiple_workspace_processes() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1804,46 +1879,37 @@ toolCallCount = 1
             .save_to_path(&router_config_path)
             .expect("save router config");
 
-        let mut worker = AppState::from_config_path(
+        let mut first_worker = AppState::from_config_path(
             8787,
             workspace.to_string_lossy().into_owned(),
             router_config_path.clone(),
         )
-        .expect("create worker state");
-        let worker_config_path = worker
-            .isolate_workspace_worker_config()
-            .expect("isolate worker config");
-        assert_ne!(worker_config_path, router_config_path);
+        .expect("create first worker state");
+        let mut second_worker = AppState::from_config_path(
+            8788,
+            workspace.to_string_lossy().into_owned(),
+            router_config_path.clone(),
+        )
+        .expect("create second worker state");
 
-        worker.theme = "concise".into();
-        worker.record_turn_usage(100, 50);
-        worker.persist_state().expect("persist worker state");
+        first_worker.record_turn_usage(100, 50);
+        second_worker.record_turn_usage(40, 10);
+        first_worker.persist_state().expect("persist first worker");
+        second_worker
+            .persist_state()
+            .expect("persist second worker");
 
-        let router_after =
-            AppConfig::load_from_path(&router_config_path).expect("reload router config");
-        assert_eq!(router_after.theme, "neon");
-        let router_usage = router_after
+        let shared_config =
+            AppConfig::load_from_path(&router_config_path).expect("reload shared config");
+        assert_eq!(shared_config.theme, "neon");
+        let usage = shared_config
             .usage_by_model
             .get(CURRENT_USAGE_BUCKET)
-            .expect("router usage");
-        assert_eq!(router_usage.total_tokens, 15);
-        assert_eq!(router_usage.tool_call_count, 1);
-
-        let worker_after =
-            AppConfig::load_from_path(&worker_config_path).expect("reload worker config");
-        assert_eq!(worker_after.theme, "concise");
-        let worker_usage = worker_after
-            .usage_by_model
-            .get(CURRENT_USAGE_BUCKET)
-            .expect("worker usage");
-        assert_eq!(worker_usage.total_tokens, 165);
-        assert_eq!(worker_usage.tool_call_count, 2);
+            .expect("shared usage");
+        assert_eq!(usage.total_tokens, 215);
+        assert_eq!(usage.tool_call_count, 3);
 
         let _ = std::fs::remove_file(router_config_path);
-        let _ = std::fs::remove_file(&worker_config_path);
-        if let Some(parent) = worker_config_path.parent() {
-            let _ = std::fs::remove_dir_all(parent);
-        }
         let _ = std::fs::remove_dir_all(workspace);
     }
 

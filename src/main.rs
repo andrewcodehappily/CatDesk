@@ -39,7 +39,7 @@ use state::{
     ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path, flow_anim_lit_count,
     load_app_config, load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
     local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
-    save_widget_corner_style, set_process_config_path_override, user_home_dir,
+    save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -1515,14 +1515,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ensure_background_router(&app.mcp_slug).await?;
         app.port = workspace_router::reserve_worker_port(&workspace_root)?;
         app.workspace_worker = true;
-        let worker_config = app.isolate_workspace_worker_config()?;
-        set_process_config_path_override(worker_config.clone()).map_err(std::io::Error::other)?;
         app.log(
             "INFO",
             format!(
-                "Shared CatDesk router is ready; registered this process as a workspace worker on port {} with isolated config {}",
-                app.port,
-                worker_config.display()
+                "Shared CatDesk router is ready; registered this process as a workspace worker on port {}",
+                app.port
             ),
         );
         let heartbeat_workspace = workspace_root.clone();
@@ -1671,6 +1668,7 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
     let state: SharedState = Arc::new(Mutex::new(app));
     {
         let mut app = state.lock().await;
+        app.workspace_router = true;
         app.persist_state_with_log();
     }
 
@@ -1690,7 +1688,10 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
         app.log("INFO", "Background workspace router started".into());
     }
     if let Err(error) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {error}"));
+        return Err(std::io::Error::other(format!(
+            "background router could not start ngrok: {error}"
+        ))
+        .into());
     }
 
     // Keep the startup lock from the final no-client check until axum has
@@ -1701,24 +1702,14 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
         None::<workspace_router::RouterStartupLock>,
     ));
     let shutdown_lock_for_wait = shutdown_lock.clone();
-    let shutdown_lock_for_refresh = shutdown_lock.clone();
-    let lock_refresher = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            if let Some(lock) = shutdown_lock_for_refresh
-                .lock()
-                .expect("router shutdown lock poisoned")
-                .as_ref()
-            {
-                let _ = lock.refresh();
-            }
-        }
-    });
+    let state_for_shutdown = state.clone();
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
+                if !state_for_shutdown.lock().await.ngrok_running {
+                    break;
+                }
                 let has_clients =
                     tokio::task::spawn_blocking(workspace_router::has_live_router_clients)
                         .await
@@ -1750,7 +1741,6 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .await;
-    lock_refresher.abort();
     shutdown_lock
         .lock()
         .expect("router shutdown lock poisoned")
