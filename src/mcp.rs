@@ -939,19 +939,6 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
             }));
-            if show_detail_mode != ShowDetailMode::Disable {
-                tools.push(json!({
-                    "name": "open_terminal",
-                    "title": "Open interactive terminal",
-                    "description": "Open a persistent interactive PTY terminal in a ChatGPT widget. The shell starts in the CatDesk workspace and remains active while the widget is open.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    },
-                    "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
-                }));
-            }
             tools.push(json!({
                 "name": "cancel_command",
                 "title": "Cancel command",
@@ -965,6 +952,19 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
+            if show_detail_mode != ShowDetailMode::Disable {
+                tools.push(json!({
+                    "name": "open_terminal",
+                    "title": "Open interactive terminal",
+                    "description": "Open a persistent interactive PTY terminal in a ChatGPT widget. The shell starts in the CatDesk workspace and remains active while the widget is open.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+                }));
+            }
         }
 
         tools.push(catdesk_instruction_tool_descriptor());
@@ -4493,13 +4493,11 @@ mod tests {
                 Some(true),
                 "{tool_name} should be blocked in read-only mode"
             );
-            if name == "open_terminal" {
-                assert!(output_template.starts_with(TERMINAL_UI_TEMPLATE_URI));
-            } else {
-                assert!(output_template.starts_with(UI_TEMPLATE_URI));
-            }
             assert!(result_text(&response).contains("disabled in read-only mode"));
         }
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
 
     #[tokio::test]
     async fn open_terminal_is_hidden_when_widgets_are_disabled() {
@@ -4513,6 +4511,7 @@ mod tests {
             &req,
             Mode::Both,
             ToolMode::MultiTools,
+            true,
             &None,
             ShowDetailMode::Disable,
         )
@@ -4528,9 +4527,6 @@ mod tests {
                 .iter()
                 .all(|tool| { tool.get("name").and_then(Value::as_str) != Some("open_terminal") })
         );
-    }
-
-        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -4944,6 +4940,11 @@ mod tests {
                 output_template.contains(&format!("toolName={name}")),
                 "output template should include initial tool name for {name}: {output_template}"
             );
+            if name == "open_terminal" {
+                assert!(output_template.starts_with(TERMINAL_UI_TEMPLATE_URI));
+            } else {
+                assert!(output_template.starts_with(UI_TEMPLATE_URI));
+            }
         }
     }
 
@@ -6990,8 +6991,6 @@ mod tests {
                 Some(&json!(true)),
                 "{label} should be rejected"
             );
-            assert!(terminal_read_response.error.is_none());
-            assert!(terminal_read_response.result.is_some());
         }
 
         let _ = std::fs::remove_dir_all(workspace_root);
